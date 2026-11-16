@@ -13,3 +13,5 @@ _tmp*/
 *.mkv
 Thumbs.db
 .DS_Store*.log
+
+.tmp_tests/

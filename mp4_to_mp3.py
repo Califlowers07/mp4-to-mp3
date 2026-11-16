@@ -28,7 +28,15 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
+
+try:  # 命令行模式不依赖 tkinter；没有安装时仍可正常转换。
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:  # pragma: no cover - 取决于运行环境
+    tk = None
+    filedialog = messagebox = ttk = None
 
 APP_NAME = "MP4 转 MP3"
 VERSION = "1.0"
@@ -39,10 +47,84 @@ VIDEO_EXTS = {
     ".wmv", ".ts", ".m2ts", ".mpg", ".mpeg", ".3gp", ".rmvb",
 }
 
+DONE = "done"
+SKIPPED = "skipped"
+FAILED = "failed"
+CANCELLED = "cancelled"
+STATUS_STYLE = {
+    DONE: ("完成", "ok"),
+    SKIPPED: ("跳过", "muted"),
+    FAILED: ("失败", "fail"),
+    CANCELLED: ("已取消", "muted"),
+}
+
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 FFMPEG = None
 FFPROBE = None
+
+
+# ---------------------------------------------------------------------------
+# 数据模型
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Options:
+    """一次转换任务的参数。"""
+
+    bitrate: str = "192k"
+    track: int = 0
+    overwrite: bool = False
+
+    def __post_init__(self) -> None:
+        if self.track < 0:
+            raise ValueError("音轨编号不能为负数。")
+
+
+@dataclass(frozen=True)
+class Job:
+    """一个源文件及其输出路径。"""
+
+    src: Path
+    dst: Path
+
+
+@dataclass(frozen=True)
+class Result:
+    """单个文件的转换结果。"""
+
+    status: str
+    message: str
+
+
+@dataclass
+class Summary:
+    """一批转换任务的计数。"""
+
+    done: int = 0
+    skipped: int = 0
+    failed: int = 0
+    cancelled: int = 0
+
+    def add(self, status: str) -> None:
+        if status == DONE:
+            self.done += 1
+        elif status == SKIPPED:
+            self.skipped += 1
+        elif status == CANCELLED:
+            self.cancelled += 1
+        else:
+            self.failed += 1
+
+    def text(self) -> str:
+        text = f"成功 {self.done}，跳过 {self.skipped}，失败 {self.failed}"
+        if self.cancelled:
+            text += f"，取消 {self.cancelled}"
+        return text
+
+    @property
+    def exit_code(self) -> int:
+        return 0 if self.failed == 0 and self.cancelled == 0 else 1
 
 
 class ToolMissing(RuntimeError):
@@ -173,6 +255,13 @@ def human_size(size: int) -> str:
     return f"{value:.1f} GB"
 
 
+def _silent_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _terminate_process(proc: subprocess.Popen) -> None:
     """尽量结束 ffmpeg，避免 Ctrl+C 后留下后台进程。"""
     try:
@@ -186,70 +275,74 @@ def _terminate_process(proc: subprocess.Popen) -> None:
             pass
 
 
-def convert_one(
-    src: Path,
-    dst: Path,
-    *,
-    bitrate: str = "192k",
-    track: int = 0,
-    overwrite: bool = False,
-    on_progress=None,
-    cancel_event: threading.Event | None = None,
-) -> tuple[str, str]:
-    """
-    把一个视频的音频轨道转换成 MP3。
+def _close_pipes(proc: subprocess.Popen) -> None:
+    """关闭 Popen 的文本管道，避免 ResourceWarning 与句柄泄漏。"""
+    for stream in (proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
 
-    返回 (status, message)，status 为 done / skipped / failed / cancelled。
-    """
-    src = Path(src)
-    dst = Path(dst)
 
-    if not src.is_file():
-        return "failed", "源文件不存在"
-    if src.resolve() == dst.resolve():
-        return "failed", "输出文件与源文件相同"
-    if dst.exists() and not overwrite:
-        return "skipped", "目标 MP3 已存在"
-
-    try:
-        ffmpeg, ffprobe = ensure_tools()
-    except ToolMissing as exc:
-        return "failed", str(exc)
-
-    if probe_audio(ffprobe, src, track) is None:
-        return "failed", "文件里没有找到音频轨道"
-
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return "failed", f"无法创建输出文件夹：{exc}"
-
-    duration = probe_duration(ffprobe, src)
-    tmp = dst.with_name(dst.name + ".part")
-    try:
-        tmp.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-    cmd = [
+def _ffmpeg_cmd(ffmpeg: str, src: Path, dst: Path, options: Options) -> list[str]:
+    return [
         ffmpeg,
         "-hide_banner", "-nostdin", "-y",
         "-loglevel", "error",
         "-progress", "pipe:1", "-nostats",
         "-i", str(src),
-        "-map", f"0:a:{track}",
+        "-map", f"0:a:{options.track}",
         "-vn",
         "-c:a", "libmp3lame",
-        "-b:a", bitrate,
+        "-b:a", options.bitrate,
         "-id3v2_version", "3",
         "-map_metadata", "0",
         "-f", "mp3",
-        str(tmp),
+        str(dst),
     ]
+
+
+def convert_one(
+    src: Path,
+    dst: Path,
+    options: Options = Options(),
+    *,
+    on_progress=None,
+    cancel_event: threading.Event | None = None,
+) -> Result:
+    """把视频中的一条音轨转换为 MP3。"""
+    src = Path(src)
+    dst = Path(dst)
+
+    if not src.is_file():
+        return Result(FAILED, "源文件不存在")
+    if src.resolve() == dst.resolve():
+        return Result(FAILED, "输出文件与源文件相同")
+    if dst.exists() and not options.overwrite:
+        return Result(SKIPPED, "目标 MP3 已存在")
+
+    try:
+        ffmpeg, ffprobe = ensure_tools()
+    except ToolMissing as exc:
+        return Result(FAILED, str(exc))
+
+    if probe_audio(ffprobe, src, options.track) is None:
+        return Result(FAILED, "文件里没有找到音频轨道")
+
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return Result(FAILED, f"无法创建输出文件夹：{exc}")
+
+    duration = probe_duration(ffprobe, src)
+    tmp = dst.with_name(dst.name + ".part")
+    _silent_unlink(tmp)
 
     try:
         proc = subprocess.Popen(
-            cmd,
+            _ffmpeg_cmd(ffmpeg, src, tmp, options),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -259,7 +352,7 @@ def convert_one(
             bufsize=1,
         )
     except OSError as exc:
-        return "failed", f"无法启动 ffmpeg：{exc}"
+        return Result(FAILED, f"无法启动 ffmpeg：{exc}")
 
     cancelled = False
     assert proc.stdout is not None
@@ -280,8 +373,12 @@ def convert_one(
                 on_progress(1.0)
     except KeyboardInterrupt:
         _terminate_process(proc)
+        _close_pipes(proc)
         _silent_unlink(tmp)
         raise
+
+    if proc.stdout is not None:
+        proc.stdout.close()
 
     try:
         proc.wait(timeout=10)
@@ -290,6 +387,7 @@ def convert_one(
         proc.wait()
     except KeyboardInterrupt:
         _terminate_process(proc)
+        _close_pipes(proc)
         _silent_unlink(tmp)
         raise
 
@@ -299,38 +397,33 @@ def convert_one(
             stderr_text = proc.stderr.read() or ""
         except (OSError, ValueError):
             stderr_text = ""
+        finally:
+            proc.stderr.close()
 
-    if cancelled:
+    if cancelled or (cancel_event is not None and cancel_event.is_set()):
         _silent_unlink(tmp)
-        return "cancelled", "已取消"
+        return Result(CANCELLED, "已取消")
 
     if proc.returncode != 0:
         _silent_unlink(tmp)
         detail = " ".join(stderr_text.strip().split())
         if len(detail) > 600:
             detail = detail[:600] + "…"
-        return "failed", detail or f"ffmpeg 退出码 {proc.returncode}"
+        return Result(FAILED, detail or f"ffmpeg 退出码 {proc.returncode}")
 
     if not tmp.is_file() or tmp.stat().st_size == 0:
         _silent_unlink(tmp)
-        return "failed", "ffmpeg 没有生成有效文件"
+        return Result(FAILED, "ffmpeg 没有生成有效文件")
 
     try:
         os.replace(tmp, dst)
     except OSError as exc:
         _silent_unlink(tmp)
-        return "failed", f"无法保存输出文件：{exc}"
+        return Result(FAILED, f"无法保存输出文件：{exc}")
 
     if on_progress is not None:
         on_progress(1.0)
-    return "done", human_size(dst.stat().st_size)
-
-
-def _silent_unlink(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
+    return Result(DONE, human_size(dst.stat().st_size))
 
 
 # ---------------------------------------------------------------------------
@@ -384,10 +477,7 @@ def collect_inputs(raw_inputs: list[str], recursive: bool = False) -> tuple[list
 
 def plan_output(src: Path, outdir: Path | None, used: set[str]) -> Path:
     """决定输出路径；同一批里重名时自动加 (2)、(3)。"""
-    if outdir is not None:
-        dst = Path(outdir) / f"{src.stem}.mp3"
-    else:
-        dst = src.with_suffix(".mp3")
+    dst = Path(outdir) / f"{src.stem}.mp3" if outdir is not None else src.with_suffix(".mp3")
 
     key = str(dst).lower()
     if key in used:
@@ -402,9 +492,25 @@ def plan_output(src: Path, outdir: Path | None, used: set[str]) -> Path:
     return dst
 
 
+def plan_jobs(files: list[Path], outdir: Path | None = None) -> list[Job]:
+    """为一批源文件规划输出路径，供 CLI 和 GUI 共用。"""
+    used: set[str] = set()
+    return [Job(src, plan_output(src, outdir, used)) for src in files]
+
+
 # ---------------------------------------------------------------------------
 # 命令行
 # ---------------------------------------------------------------------------
+
+def _non_negative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("必须是整数")
+    if number < 0:
+        raise argparse.ArgumentTypeError("不能为负数")
+    return number
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -427,7 +533,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="递归扫描子文件夹")
     parser.add_argument("-f", "--force", action="store_true",
                         help="覆盖已经存在的 MP3")
-    parser.add_argument("--track", type=int, default=0, metavar="N",
+    parser.add_argument("--track", type=_non_negative_int, default=0, metavar="N",
                         help="使用第 N 条音轨，从 0 开始（默认 0）")
     parser.add_argument("--gui", action="store_true", help="打开图形界面")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -472,25 +578,21 @@ def run_cli(argv: list[str]) -> int:
             print(f"错误：无法创建输出文件夹：{exc}", file=sys.stderr)
             return 2
 
+    jobs = plan_jobs(files, outdir)
+    options = Options(bitrate=bitrate, track=args.track, overwrite=args.force)
+
     print(f"{APP_NAME}  v{VERSION}")
     print(f"ffmpeg：{ffmpeg}")
-    print(f"共 {len(files)} 个文件，码率 {bitrate}"
+    print(f"共 {len(jobs)} 个文件，码率 {bitrate}"
           + (f"，输出到 {outdir}" if outdir else "，输出到源文件夹"))
     print("-" * 60)
 
-    used: set[str] = set()
-    done = skipped = failed = 0
+    summary = Summary()
     started_at = time.perf_counter()
 
     try:
-        for index, src in enumerate(files, 1):
-            dst = plan_output(src, outdir, used)
-            print(f"[{index}/{len(files)}] {src.name}  →  {dst.name}")
-            if src.suffix.lower() == ".mp3":
-                print("    失败：输入文件已经是 MP3")
-                failed += 1
-                continue
-
+        for index, job in enumerate(jobs, 1):
+            print(f"[{index}/{len(jobs)}] {job.src.name}  →  {job.dst.name}")
             last_percent = -1
 
             def on_progress(fraction: float) -> None:
@@ -500,52 +602,422 @@ def run_cli(argv: list[str]) -> int:
                     print(f"\r    转换中 {percent:3d}%", end="", flush=True)
                     last_percent = percent
 
-            status, message = convert_one(
-                src, dst,
-                bitrate=bitrate,
-                track=args.track,
-                overwrite=args.force,
+            result = convert_one(
+                job.src, job.dst, options,
                 on_progress=on_progress if sys.stdout.isatty() else None,
             )
             if sys.stdout.isatty():
                 print("\r" + " " * 20 + "\r", end="")
 
-            if status == "done":
-                done += 1
-                print(f"    完成  {message}")
-            elif status == "skipped":
-                skipped += 1
-                print(f"    跳过：{message}（加 -f 可覆盖）")
-            elif status == "cancelled":
-                failed += 1
+            summary.add(result.status)
+            if result.status == DONE:
+                print(f"    完成  {result.message}")
+            elif result.status == SKIPPED:
+                print(f"    跳过：{result.message}（加 -f 可覆盖）")
+            elif result.status == CANCELLED:
                 print("    已取消")
             else:
-                failed += 1
-                print(f"    失败：{message}")
+                print(f"    失败：{result.message}")
     except KeyboardInterrupt:
         print("\n用户中断，已停止。")
         return 130
 
     elapsed = time.perf_counter() - started_at
     print("-" * 60)
-    print(f"结束：成功 {done}，跳过 {skipped}，失败 {failed}，用时 {elapsed:.1f} 秒")
-    return 0 if failed == 0 else 1
+    print(f"结束：{summary.text()}，用时 {elapsed:.1f} 秒")
+    return summary.exit_code
 
 
 # ---------------------------------------------------------------------------
 # 图形界面
 # ---------------------------------------------------------------------------
 
-def run_gui() -> int:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+def _enable_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
 
-    if os.name == "nt":
+
+def _set_default_fonts() -> None:
+    try:
+        from tkinter import font as tkfont
+        for font_name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            tkfont.nametofont(font_name).configure(family="Microsoft YaHei UI", size=10)
+    except Exception:
+        pass
+
+
+class App:
+    """图形界面。把类放在模块级，便于测试和复用。"""
+
+    def __init__(self, root, ffmpeg_path: str) -> None:
+        self.root = root
+        self.ffmpeg_path = ffmpeg_path
+        self.items: dict[str, Path] = {}
+        self.events: queue.Queue = queue.Queue()
+        self.cancel = threading.Event()
+        self.running = False
+        self.worker: threading.Thread | None = None
+
+        self.out_mode = tk.StringVar(value="source")
+        self.out_dir = tk.StringVar()
+        self.bitrate = tk.StringVar(value="192")
+        self.overwrite = tk.BooleanVar(value=False)
+        self.status = tk.StringVar(value="就绪")
+        self.count = tk.StringVar(value="共 0 个文件")
+
+        self.root.title(f"{APP_NAME} · 音频提取工具  v{VERSION}")
+        self.root.geometry("820x640")
+        self.root.minsize(700, 560)
+        _set_default_fonts()
+
+        self._build()
+        self._set_busy(False)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(100, self._poll)
+        self.log(f"就绪 · ffmpeg: {ffmpeg_path}")
+        self.log("添加视频后点击“开始转换”；输出 MP3 默认放在源文件旁边。")
+
+    # -- 界面 ----------------------------------------------------------
+    def _build(self) -> None:
+        outer = ttk.Frame(self.root, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        toolbar = ttk.Frame(outer)
+        toolbar.pack(fill="x")
+        self.btn_add = ttk.Button(toolbar, text="添加文件…", command=self.add_files)
+        self.btn_add.pack(side="left")
+        self.btn_folder = ttk.Button(toolbar, text="添加文件夹…", command=self.add_folder)
+        self.btn_folder.pack(side="left", padx=(6, 0))
+        self.btn_remove = ttk.Button(toolbar, text="移除选中", command=self.remove_selected)
+        self.btn_remove.pack(side="left", padx=(6, 0))
+        self.btn_clear = ttk.Button(toolbar, text="清空列表", command=self.clear_all)
+        self.btn_clear.pack(side="left", padx=(6, 0))
+        ttk.Label(toolbar, textvariable=self.count).pack(side="right")
+
+        list_frame = ttk.Frame(outer)
+        list_frame.pack(fill="both", expand=True, pady=(10, 0))
+
+        self.tree = ttk.Treeview(
+            list_frame,
+            columns=("file", "status"),
+            show="headings",
+            selectmode="extended",
+            height=8,
+        )
+        self.tree.heading("file", text="文件")
+        self.tree.heading("status", text="状态")
+        self.tree.column("file", width=600, anchor="w")
+        self.tree.column("status", width=110, anchor="center", stretch=False)
+        self.tree.tag_configure("ok", foreground="#1a7f37")
+        self.tree.tag_configure("fail", foreground="#c62828")
+        self.tree.tag_configure("run", foreground="#1565c0")
+        self.tree.tag_configure("muted", foreground="#888888")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        options = ttk.LabelFrame(outer, text="输出设置", padding=10)
+        options.pack(fill="x", pady=(10, 0))
+
+        row1 = ttk.Frame(options)
+        row1.pack(fill="x")
+        self.row1 = row1
+        ttk.Label(row1, text="输出位置：").pack(side="left")
+        self.radio_source = ttk.Radiobutton(
+            row1, text="源文件所在文件夹", variable=self.out_mode,
+            value="source", command=self._sync_outdir,
+        )
+        self.radio_source.pack(side="left")
+        self.radio_custom = ttk.Radiobutton(
+            row1, text="指定文件夹", variable=self.out_mode,
+            value="custom", command=self._sync_outdir,
+        )
+        self.radio_custom.pack(side="left", padx=(16, 0))
+        self.chk_overwrite = ttk.Checkbutton(
+            row1, text="覆盖已存在的 MP3", variable=self.overwrite,
+        )
+        self.chk_overwrite.pack(side="right")
+
+        row2 = ttk.Frame(options)
+        row2.pack(fill="x", pady=(8, 0))
+        self.row2 = row2
+        self.entry_out = ttk.Entry(row2, textvariable=self.out_dir)
+        self.entry_out.pack(side="left", fill="x", expand=True)
+        self.btn_browse = ttk.Button(row2, text="浏览…", command=self.choose_outdir)
+        self.btn_browse.pack(side="left", padx=(6, 0))
+
+        row3 = ttk.Frame(options)
+        row3.pack(fill="x", pady=(8, 0))
+        ttk.Label(row3, text="MP3 码率：").pack(side="left")
+        self.combo_bitrate = ttk.Combobox(
+            row3, textvariable=self.bitrate, values=("128", "192", "256", "320"),
+            width=6, state="readonly",
+        )
+        self.combo_bitrate.pack(side="left")
+        ttk.Label(row3, text="kbps　（192 适合日常，320 音质最好）").pack(
+            side="left", padx=(6, 0)
+        )
+
+        action = ttk.Frame(outer)
+        action.pack(fill="x", pady=(12, 0))
+        self.btn_start = ttk.Button(action, text="开始转换", command=self.start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(action, text="停止", command=self.stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=(6, 10))
+        self.progress = ttk.Progressbar(action, mode="determinate", maximum=100)
+        self.progress.pack(side="left", fill="x", expand=True)
+        ttk.Label(action, textvariable=self.status, width=24).pack(
+            side="left", padx=(10, 0)
+        )
+
+        log_frame = ttk.LabelFrame(outer, text="日志", padding=6)
+        log_frame.pack(fill="both", expand=False, pady=(10, 0))
+        self.log_text = tk.Text(
+            log_frame, height=7, wrap="word", state="disabled",
+            relief="solid", borderwidth=1,
+        )
+        self.log_text.pack(side="left", fill="both", expand=True)
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+
+    def _sync_outdir(self) -> None:
+        custom = self.out_mode.get() == "custom"
+        if custom:
+            self.row2.pack(fill="x", pady=(8, 0), after=self.row1)
+            state = "normal" if not self.running else "disabled"
+        else:
+            self.row2.pack_forget()
+            state = "disabled"
+        self.entry_out.configure(state=state)
+        self.btn_browse.configure(state=state)
+
+    def _set_busy(self, busy: bool) -> None:
+        self.running = busy
+        state = "disabled" if busy else "normal"
+        for widget in (
+            self.btn_add, self.btn_folder, self.btn_remove, self.btn_clear,
+            self.radio_source, self.radio_custom, self.chk_overwrite,
+        ):
+            widget.configure(state=state)
+        self.combo_bitrate.configure(state="disabled" if busy else "readonly")
+        self.btn_start.configure(state="disabled" if busy else "normal")
+        self.btn_stop.configure(state="normal" if busy else "disabled")
+        self._sync_outdir()
+
+    # -- 列表管理 ------------------------------------------------------
+    def _add_paths(self, paths) -> None:
+        added = 0
+        existing = {str(p).lower() for p in self.items.values()}
+        for path in paths:
+            path = Path(path)
+            if not _is_video(path):
+                continue
+            key = str(path).lower()
+            if key in existing:
+                continue
+            existing.add(key)
+            iid = self.tree.insert("", "end", values=(str(path), "等待"))
+            self.items[iid] = path
+            added += 1
+        self.count.set(f"共 {len(self.items)} 个文件")
+        if added:
+            self.log(f"已添加 {added} 个文件。")
+        elif paths:
+            self.log("没有添加新文件（可能重复或格式不支持）。")
+
+    def add_files(self) -> None:
+        chosen = filedialog.askopenfilenames(
+            title="选择视频文件",
+            filetypes=[
+                ("视频文件", "*.mp4 *.m4v *.mov *.mkv *.avi *.webm *.flv *.wmv *.ts *.m2ts"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if chosen:
+            self._add_paths(chosen)
+
+    def add_folder(self) -> None:
+        chosen = filedialog.askdirectory(title="选择文件夹（包含子文件夹）")
+        if not chosen:
+            return
+        self.log(f"正在扫描：{chosen}")
+        self.root.update_idletasks()
+        self._add_paths(sorted(p for p in Path(chosen).rglob("*") if _is_video(p)))
+
+    def remove_selected(self) -> None:
+        if self.running:
+            return
+        for iid in self.tree.selection():
+            self.tree.delete(iid)
+            self.items.pop(iid, None)
+        self.count.set(f"共 {len(self.items)} 个文件")
+
+    def clear_all(self) -> None:
+        if self.running:
+            return
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        self.items.clear()
+        self.count.set("共 0 个文件")
+        self.progress["value"] = 0
+        self.status.set("就绪")
+
+    def choose_outdir(self) -> None:
+        chosen = filedialog.askdirectory(title="选择输出文件夹")
+        if chosen:
+            self.out_dir.set(chosen)
+            self.out_mode.set("custom")
+            self._sync_outdir()
+
+    # -- 转换流程 ------------------------------------------------------
+    def start(self) -> None:
+        if self.running:
+            return
+        if not self.items:
+            messagebox.showinfo(APP_NAME, "请先添加要转换的视频文件。")
+            return
+
+        outdir = None
+        if self.out_mode.get() == "custom":
+            raw = self.out_dir.get().strip()
+            if not raw:
+                messagebox.showwarning(APP_NAME, "请选择输出文件夹。")
+                return
+            outdir = Path(raw)
+            try:
+                outdir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror(APP_NAME, f"无法创建输出文件夹：\n{exc}")
+                return
+
         try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
+            bitrate = normalize_bitrate(self.bitrate.get())
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+
+        self._set_busy(True)
+        self.cancel.clear()
+        self.progress["value"] = 0
+        self.status.set("准备中…")
+        for iid in self.items:
+            self.tree.set(iid, "status", "等待")
+            self.tree.item(iid, tags=())
+
+        self.log("-" * 56)
+        self.log(f"开始转换 {len(self.items)} 个文件 · {bitrate}"
+                 + (f" · 输出到 {outdir}" if outdir else " · 输出到源文件夹"))
+
+        items = list(self.items.items())
+        options = Options(bitrate=bitrate, track=0, overwrite=self.overwrite.get())
+        self.worker = threading.Thread(
+            target=self._work, args=(items, outdir, options), daemon=True,
+        )
+        self.worker.start()
+
+    def _work(self, items, outdir: Path | None, options: Options) -> None:
+        total = len(items)
+        jobs = plan_jobs([src for _, src in items], outdir)
+        summary = Summary()
+
+        for index, ((iid, src), job) in enumerate(zip(items, jobs)):
+            if self.cancel.is_set():
+                summary.add(CANCELLED)
+                self.events.put(("status", iid, "已取消", "muted"))
+                self.events.put(("log", f"[{index + 1}/{total}] 取消 {src.name}"))
+                self.events.put(("progress", (index + 1) / total * 100))
+                continue
+
+            self.events.put(("status", iid, "转换中…", "run"))
+
+            def on_progress(fraction: float, i: int = index) -> None:
+                self.events.put(("progress", (i + fraction) / total * 100))
+
+            result = convert_one(
+                job.src, job.dst, options,
+                on_progress=on_progress, cancel_event=self.cancel,
+            )
+            summary.add(result.status)
+            label, tag = STATUS_STYLE[result.status]
+            self.events.put(("status", iid, label, tag))
+
+            if result.status == DONE:
+                self.events.put(("log", f"[{index + 1}/{total}] 完成 {src.name} → "
+                                          f"{job.dst.name}（{result.message}）"))
+            elif result.status == SKIPPED:
+                self.events.put(("log", f"[{index + 1}/{total}] 跳过 {src.name}：{result.message}"))
+            elif result.status == CANCELLED:
+                self.events.put(("log", f"[{index + 1}/{total}] 取消 {src.name}"))
+            else:
+                self.events.put(("log", f"[{index + 1}/{total}] 失败 {src.name}：{result.message}"))
+
+            self.events.put(("progress", (index + 1) / total * 100))
+
+        self.events.put(("done", summary.text()))
+
+    def stop(self) -> None:
+        if not self.running:
+            return
+        self.cancel.set()
+        self.status.set("正在停止…")
+        self.btn_stop.configure(state="disabled")
+        self.log("正在停止，请稍候…")
+
+    def _poll(self) -> None:
+        try:
+            while True:
+                event = self.events.get_nowait()
+                kind = event[0]
+                if kind == "status":
+                    _, iid, text, tag = event
+                    if self.tree.exists(iid):
+                        self.tree.set(iid, "status", text)
+                        self.tree.item(iid, tags=(tag,) if tag else ())
+                elif kind == "progress":
+                    self.progress["value"] = event[1]
+                elif kind == "log":
+                    self.log(event[1])
+                elif kind == "done":
+                    self._finish(event[1])
+        except queue.Empty:
             pass
+        self.root.after(100, self._poll)
+
+    def _finish(self, summary: str) -> None:
+        self._set_busy(False)
+        self.status.set(summary)
+        self.log(f"全部结束：{summary}")
+
+    def log(self, message: str) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", time.strftime("%H:%M:%S  ") + message + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _on_close(self) -> None:
+        if self.running:
+            messagebox.showwarning(
+                APP_NAME,
+                "正在转换，请先点击「停止」，等待当前文件结束后再关闭。",
+            )
+            return
+        self.root.destroy()
+
+
+def run_gui() -> int:
+    if tk is None:
+        print("错误：当前 Python 缺少 tkinter，无法打开图形界面。", file=sys.stderr)
+        return 2
+
+    _enable_dpi_awareness()
 
     try:
         ffmpeg, _ = ensure_tools()
@@ -557,388 +1029,7 @@ def run_gui() -> int:
         return 2
 
     root = tk.Tk()
-    root.title(f"{APP_NAME} · 音频提取工具  v{VERSION}")
-    root.geometry("820x640")
-    root.minsize(700, 560)
-
-    try:
-        from tkinter import font as tkfont
-        for font_name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
-            tkfont.nametofont(font_name).configure(family="Microsoft YaHei UI", size=10)
-    except Exception:
-        pass
-
-    class App:
-        def __init__(self, window: tk.Tk) -> None:
-            self.root = window
-            self.items: dict[str, Path] = {}
-            self.events: queue.Queue = queue.Queue()
-            self.cancel = threading.Event()
-            self.running = False
-            self.worker: threading.Thread | None = None
-
-            self.out_mode = tk.StringVar(value="source")
-            self.out_dir = tk.StringVar()
-            self.bitrate = tk.StringVar(value="192")
-            self.overwrite = tk.BooleanVar(value=False)
-            self.status = tk.StringVar(value="就绪")
-            self.count = tk.StringVar(value="共 0 个文件")
-
-            self._build()
-            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-            self.root.after(100, self._poll)
-            self.log(f"就绪 · ffmpeg: {ffmpeg}")
-            self.log("添加视频后点击“开始转换”；输出 MP3 默认放在源文件旁边。")
-
-        # -- 界面 ----------------------------------------------------------
-        def _build(self) -> None:
-            outer = ttk.Frame(self.root, padding=12)
-            outer.pack(fill="both", expand=True)
-
-            toolbar = ttk.Frame(outer)
-            toolbar.pack(fill="x")
-            self.btn_add = ttk.Button(toolbar, text="添加文件…", command=self.add_files)
-            self.btn_add.pack(side="left")
-            self.btn_folder = ttk.Button(toolbar, text="添加文件夹…", command=self.add_folder)
-            self.btn_folder.pack(side="left", padx=(6, 0))
-            self.btn_remove = ttk.Button(toolbar, text="移除选中", command=self.remove_selected)
-            self.btn_remove.pack(side="left", padx=(6, 0))
-            self.btn_clear = ttk.Button(toolbar, text="清空列表", command=self.clear_all)
-            self.btn_clear.pack(side="left", padx=(6, 0))
-            ttk.Label(toolbar, textvariable=self.count).pack(side="right")
-
-            list_frame = ttk.Frame(outer)
-            list_frame.pack(fill="both", expand=True, pady=(10, 0))
-
-            self.tree = ttk.Treeview(
-                list_frame,
-                columns=("file", "status"),
-                show="headings",
-                selectmode="extended",
-                height=8,
-            )
-            self.tree.heading("file", text="文件")
-            self.tree.heading("status", text="状态")
-            self.tree.column("file", width=600, anchor="w")
-            self.tree.column("status", width=110, anchor="center", stretch=False)
-            self.tree.tag_configure("ok", foreground="#1a7f37")
-            self.tree.tag_configure("fail", foreground="#c62828")
-            self.tree.tag_configure("run", foreground="#1565c0")
-            self.tree.tag_configure("muted", foreground="#888888")
-            self.tree.pack(side="left", fill="both", expand=True)
-
-            scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
-            scrollbar.pack(side="right", fill="y")
-            self.tree.configure(yscrollcommand=scrollbar.set)
-
-            options = ttk.LabelFrame(outer, text="输出设置", padding=10)
-            options.pack(fill="x", pady=(10, 0))
-
-            row1 = ttk.Frame(options)
-            row1.pack(fill="x")
-            self.row1 = row1
-            ttk.Label(row1, text="输出位置：").pack(side="left")
-            self.radio_source = ttk.Radiobutton(
-                row1, text="源文件所在文件夹", variable=self.out_mode,
-                value="source", command=self._sync_outdir,
-            )
-            self.radio_source.pack(side="left")
-            self.radio_custom = ttk.Radiobutton(
-                row1, text="指定文件夹", variable=self.out_mode,
-                value="custom", command=self._sync_outdir,
-            )
-            self.radio_custom.pack(side="left", padx=(16, 0))
-            self.chk_overwrite = ttk.Checkbutton(
-                row1, text="覆盖已存在的 MP3", variable=self.overwrite,
-            )
-            self.chk_overwrite.pack(side="right")
-
-            row2 = ttk.Frame(options)
-            row2.pack(fill="x", pady=(8, 0))
-            self.row2 = row2
-            self.entry_out = ttk.Entry(row2, textvariable=self.out_dir)
-            self.entry_out.pack(side="left", fill="x", expand=True)
-            self.btn_browse = ttk.Button(row2, text="浏览…", command=self.choose_outdir)
-            self.btn_browse.pack(side="left", padx=(6, 0))
-
-            row3 = ttk.Frame(options)
-            row3.pack(fill="x", pady=(8, 0))
-            ttk.Label(row3, text="MP3 码率：").pack(side="left")
-            self.combo_bitrate = ttk.Combobox(
-                row3, textvariable=self.bitrate, values=("128", "192", "256", "320"),
-                width=6, state="readonly",
-            )
-            self.combo_bitrate.pack(side="left")
-            ttk.Label(row3, text="kbps　（192 适合日常，320 音质最好）").pack(
-                side="left", padx=(6, 0)
-            )
-
-            action = ttk.Frame(outer)
-            action.pack(fill="x", pady=(12, 0))
-            self.btn_start = ttk.Button(action, text="开始转换", command=self.start)
-            self.btn_start.pack(side="left")
-            self.btn_stop = ttk.Button(action, text="停止", command=self.stop, state="disabled")
-            self.btn_stop.pack(side="left", padx=(6, 10))
-            self.progress = ttk.Progressbar(action, mode="determinate", maximum=100)
-            self.progress.pack(side="left", fill="x", expand=True)
-            ttk.Label(action, textvariable=self.status, width=24).pack(
-                side="left", padx=(10, 0)
-            )
-
-            log_frame = ttk.LabelFrame(outer, text="日志", padding=6)
-            log_frame.pack(fill="both", expand=False, pady=(10, 0))
-            self.log_text = tk.Text(
-                log_frame, height=7, wrap="word", state="disabled",
-                relief="solid", borderwidth=1,
-            )
-            self.log_text.pack(side="left", fill="both", expand=True)
-            log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-            log_scroll.pack(side="right", fill="y")
-            self.log_text.configure(yscrollcommand=log_scroll.set)
-
-            self._sync_outdir()
-
-        def _sync_outdir(self) -> None:
-            custom = self.out_mode.get() == "custom"
-            if custom:
-                self.row2.pack(fill="x", pady=(8, 0), after=self.row1)
-                state = "normal" if not self.running else "disabled"
-            else:
-                self.row2.pack_forget()
-                state = "disabled"
-            self.entry_out.configure(state=state)
-            self.btn_browse.configure(state=state)
-
-        # -- 列表管理 ------------------------------------------------------
-        def _add_paths(self, paths) -> None:
-            added = 0
-            existing = {str(p).lower() for p in self.items.values()}
-            for path in paths:
-                path = Path(path)
-                if not _is_video(path):
-                    continue
-                key = str(path).lower()
-                if key in existing:
-                    continue
-                existing.add(key)
-                iid = self.tree.insert("", "end", values=(str(path), "等待"))
-                self.items[iid] = path
-                added += 1
-            self.count.set(f"共 {len(self.items)} 个文件")
-            if added:
-                self.log(f"已添加 {added} 个文件。")
-            elif paths:
-                self.log("没有添加新文件（可能重复或格式不支持）。")
-
-        def add_files(self) -> None:
-            chosen = filedialog.askopenfilenames(
-                title="选择视频文件",
-                filetypes=[
-                    ("视频文件", "*.mp4 *.m4v *.mov *.mkv *.avi *.webm *.flv *.wmv *.ts *.m2ts"),
-                    ("所有文件", "*.*"),
-                ],
-            )
-            if chosen:
-                self._add_paths(chosen)
-
-        def add_folder(self) -> None:
-            chosen = filedialog.askdirectory(title="选择文件夹（包含子文件夹）")
-            if not chosen:
-                return
-            self.log(f"正在扫描：{chosen}")
-            self.root.update_idletasks()
-            self._add_paths(sorted(p for p in Path(chosen).rglob("*") if _is_video(p)))
-
-        def remove_selected(self) -> None:
-            if self.running:
-                return
-            for iid in self.tree.selection():
-                self.tree.delete(iid)
-                self.items.pop(iid, None)
-            self.count.set(f"共 {len(self.items)} 个文件")
-
-        def clear_all(self) -> None:
-            if self.running:
-                return
-            for iid in self.tree.get_children():
-                self.tree.delete(iid)
-            self.items.clear()
-            self.count.set("共 0 个文件")
-            self.progress["value"] = 0
-            self.status.set("就绪")
-
-        def choose_outdir(self) -> None:
-            chosen = filedialog.askdirectory(title="选择输出文件夹")
-            if chosen:
-                self.out_dir.set(chosen)
-                self.out_mode.set("custom")
-                self._sync_outdir()
-
-        # -- 转换流程 ------------------------------------------------------
-        def start(self) -> None:
-            if self.running:
-                return
-            if not self.items:
-                messagebox.showinfo(APP_NAME, "请先添加要转换的视频文件。")
-                return
-
-            outdir = None
-            if self.out_mode.get() == "custom":
-                raw = self.out_dir.get().strip()
-                if not raw:
-                    messagebox.showwarning(APP_NAME, "请选择输出文件夹。")
-                    return
-                outdir = Path(raw)
-                try:
-                    outdir.mkdir(parents=True, exist_ok=True)
-                except OSError as exc:
-                    messagebox.showerror(APP_NAME, f"无法创建输出文件夹：\n{exc}")
-                    return
-
-            try:
-                bitrate = normalize_bitrate(self.bitrate.get())
-            except ValueError as exc:
-                messagebox.showerror(APP_NAME, str(exc))
-                return
-
-            self.running = True
-            self.cancel.clear()
-            self.progress["value"] = 0
-            self.status.set("准备中…")
-            for iid in self.items:
-                self.tree.set(iid, "status", "等待")
-                self.tree.item(iid, tags=())
-            self.btn_start.configure(state="disabled")
-            self.btn_stop.configure(state="normal")
-            for button in (self.btn_add, self.btn_folder, self.btn_remove, self.btn_clear):
-                button.configure(state="disabled")
-            self.combo_bitrate.configure(state="disabled")
-            self.radio_source.configure(state="disabled")
-            self.radio_custom.configure(state="disabled")
-            self.entry_out.configure(state="disabled")
-            self.btn_browse.configure(state="disabled")
-            self.chk_overwrite.configure(state="disabled")
-
-            self.log("-" * 56)
-            self.log(f"开始转换 {len(self.items)} 个文件 · {bitrate}"
-                     + (f" · 输出到 {outdir}" if outdir else " · 输出到源文件夹"))
-
-            items = list(self.items.items())
-            self.worker = threading.Thread(
-                target=self._work,
-                args=(items, outdir, bitrate, self.overwrite.get()),
-                daemon=True,
-            )
-            self.worker.start()
-
-        def _work(self, items, outdir: Path | None, bitrate: str, overwrite: bool) -> None:
-            total = len(items)
-            used: set[str] = set()
-            done = skipped = failed = cancelled = 0
-
-            for index, (iid, src) in enumerate(items):
-                if self.cancel.is_set():
-                    self.events.put(("status", iid, "已取消", "muted"))
-                    cancelled += 1
-                    self.events.put(("progress", (index + 1) / total * 100))
-                    continue
-
-                dst = plan_output(src, outdir, used)
-                self.events.put(("status", iid, "转换中…", "run"))
-
-                def on_progress(fraction: float, i: int = index) -> None:
-                    self.events.put(("progress", (i + fraction) / total * 100))
-
-                if src.suffix.lower() == ".mp3":
-                    status, message = "failed", "输入文件已经是 MP3"
-                else:
-                    status, message = convert_one(
-                        src, dst,
-                        bitrate=bitrate,
-                        overwrite=overwrite,
-                        on_progress=on_progress,
-                        cancel_event=self.cancel,
-                    )
-
-                if status == "done":
-                    done += 1
-                    self.events.put(("status", iid, "完成", "ok"))
-                    self.events.put(("log", f"[{index + 1}/{total}] 完成 {src.name} → {dst.name}（{message}）"))
-                elif status == "skipped":
-                    skipped += 1
-                    self.events.put(("status", iid, "跳过", "muted"))
-                    self.events.put(("log", f"[{index + 1}/{total}] 跳过 {src.name}：{message}"))
-                elif status == "cancelled":
-                    cancelled += 1
-                    self.events.put(("status", iid, "已取消", "muted"))
-                else:
-                    failed += 1
-                    self.events.put(("status", iid, "失败", "fail"))
-                    self.events.put(("log", f"[{index + 1}/{total}] 失败 {src.name}：{message}"))
-
-                self.events.put(("progress", (index + 1) / total * 100))
-
-            summary = f"成功 {done}，跳过 {skipped}，失败 {failed}"
-            if cancelled:
-                summary += f"，取消 {cancelled}"
-            self.events.put(("done", summary))
-
-        def stop(self) -> None:
-            if not self.running:
-                return
-            self.cancel.set()
-            self.status.set("正在停止…")
-            self.btn_stop.configure(state="disabled")
-            self.log("正在停止，请稍候…")
-
-        def _poll(self) -> None:
-            try:
-                while True:
-                    event = self.events.get_nowait()
-                    kind = event[0]
-                    if kind == "status":
-                        _, iid, text, tag = event
-                        if self.tree.exists(iid):
-                            self.tree.set(iid, "status", text)
-                            self.tree.item(iid, tags=(tag,) if tag else ())
-                    elif kind == "progress":
-                        self.progress["value"] = event[1]
-                    elif kind == "log":
-                        self.log(event[1])
-                    elif kind == "done":
-                        self._finish(event[1])
-            except queue.Empty:
-                pass
-            self.root.after(100, self._poll)
-
-        def _finish(self, summary: str) -> None:
-            self.running = False
-            self.status.set(summary)
-            self.log(f"全部结束：{summary}")
-
-            self.btn_start.configure(state="normal")
-            self.btn_stop.configure(state="disabled")
-            for button in (self.btn_add, self.btn_folder, self.btn_remove, self.btn_clear):
-                button.configure(state="normal")
-            self.combo_bitrate.configure(state="readonly")
-            self.radio_source.configure(state="normal")
-            self.radio_custom.configure(state="normal")
-            self.chk_overwrite.configure(state="normal")
-            self._sync_outdir()
-
-        def log(self, message: str) -> None:
-            self.log_text.configure(state="normal")
-            self.log_text.insert("end", time.strftime("%H:%M:%S  ") + message + "\n")
-            self.log_text.see("end")
-            self.log_text.configure(state="disabled")
-
-        def _on_close(self) -> None:
-            if self.running:
-                messagebox.showwarning(APP_NAME, "正在转换，请先点击「停止」，等待当前文件结束后再关闭。")
-                return
-            self.root.destroy()
-
-    App(root)
+    App(root, ffmpeg)
     root.mainloop()
     return 0
 
